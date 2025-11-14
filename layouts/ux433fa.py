@@ -1,7 +1,12 @@
 from libevdev import EV_KEY
 
-top_right_icon_width = 200
-top_right_icon_height = 250
+# Increase the activation rectangle so the numpad can be activated
+# from the top-right corner down to the "NUMLK" label area on the pad.
+# These values define how far from the right edge (width) and how
+# far down from the top edge (height) the activation rectangle extends.
+# Previously: width=200, height=250. Enlarged to better match touchpad labeling.
+top_right_icon_width = 600
+top_right_icon_height = 700
 
 top_left_icon_width = 200
 top_left_icon_height = 200

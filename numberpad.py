@@ -553,7 +553,7 @@ def wl_registry_handler(registry, id_, interface, version):
 
 
 def load_keymap_listener_wayland():
-    global stop_threads, display_wayland_var, display_wayland
+    global stop_threads, display_wayland_var, display_wayland, keymap_loaded
 
     try:
         display_wayland = Display(display_wayland_var)
@@ -566,8 +566,11 @@ def load_keymap_listener_wayland():
         while not stop_threads and display_wayland.dispatch(block=True) != -1:
             pass
     except:
-        log.exception("Wayland load keymap listener error. Exiting")
-        os.kill(os.getpid(), signal.SIGUSR1)
+        log.exception("Wayland load keymap listener error. Will continue with evdev fallback")
+        # Set keymap_loaded so the main thread doesn't hang waiting
+        keymap_loaded = True
+        # Don't kill the process - let it continue with kernel evdev fallback for Alt detection
+        # os.kill(os.getpid(), signal.SIGUSR1)
 
 
 def load_keymap_listener_x11():
@@ -711,8 +714,41 @@ CONFIG_PRESS_KEY_WHEN_IS_DONE_UNTOUCH_DEFAULT = True
 CONFIG_DISTANCE_TO_MOVE_ONLY_POINTER = "distance_to_move_only_pointer"
 CONFIG_DISTANCE_TO_MOVE_ONLY_POINTER_DEFAULT = False
 
+# require Alt modifier for top-right icon activation
+CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION = "require_alt_for_top_right_activation"
+CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION_DEFAULT = False
+CONFIG_REQUIRE_RIGHT_ALT_ONLY = "require_right_alt_only"
+CONFIG_REQUIRE_RIGHT_ALT_ONLY_DEFAULT = False
 
-config_file_path = config_file_dir + CONFIG_FILE_NAME
+# Percentage-based top-right activation (useful for different touchpad sizes)
+CONFIG_USE_PERCENT_TOP_RIGHT = "use_percent_top_right_icon"
+CONFIG_USE_PERCENT_TOP_RIGHT_DEFAULT = True
+CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT = "top_right_icon_width_percent"
+CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT_DEFAULT = 0.18
+CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT = "top_right_icon_height_percent"
+CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT_DEFAULT = 0.18
+
+# runtime flags (populated from config)
+require_alt_for_top_right_activation: bool = False
+require_right_alt_only: bool = False
+use_percent_top_right_icon: bool = True
+top_right_icon_width_percent: float = CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT_DEFAULT
+top_right_icon_height_percent: float = CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT_DEFAULT
+
+
+# Determine config file path: the second arg can be either a directory
+# (where the config filename will be appended) or a direct path to the
+# config file. Handle both cases to avoid accidental doubling of the
+# filename (e.g. "./numberpad_dev" + "numberpad_dev").
+if os.path.isdir(config_file_dir):
+    config_file_path = os.path.join(config_file_dir, CONFIG_FILE_NAME)
+else:
+    # If the provided path looks like the config filename or is a file,
+    # use it directly; otherwise append the filename.
+    if config_file_dir.endswith(CONFIG_FILE_NAME) or os.path.isfile(config_file_dir):
+        config_file_path = config_file_dir
+    else:
+        config_file_path = os.path.join(config_file_dir, CONFIG_FILE_NAME)
 config = configparser.ConfigParser()
 config_lock = threading.Lock()
 
@@ -1232,13 +1268,304 @@ def use_bindings_for_touchpad_left_icon_slide_function():
 
 
 def is_pressed_touchpad_top_right_icon():
-    global top_right_icon_width, top_right_icon_height, abs_mt_slot_x_values, abs_mt_slot_y_values, abs_mt_slot_value, maxx
+    global top_right_icon_width, top_right_icon_height, abs_mt_slot_x_values, abs_mt_slot_y_values, abs_mt_slot_value, maxx, maxy
+    global use_percent_top_right_icon, top_right_icon_width_percent, top_right_icon_height_percent
 
-    if abs_mt_slot_x_values[abs_mt_slot_value] >= maxx - top_right_icon_width and\
-        abs_mt_slot_y_values[abs_mt_slot_value] >= 0 and abs_mt_slot_y_values[abs_mt_slot_value] <= top_right_icon_height:
-            return True
+    x = abs_mt_slot_x_values[abs_mt_slot_value]
+    y = abs_mt_slot_y_values[abs_mt_slot_value]
+
+    # Compute effective pixel thresholds based on percentage config if enabled
+    try:
+        if use_percent_top_right_icon:
+            try:
+                width_px = int(maxx * float(top_right_icon_width_percent))
+            except Exception:
+                width_px = int(maxx * CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT_DEFAULT)
+            try:
+                height_px = int(maxy * float(top_right_icon_height_percent))
+            except Exception:
+                height_px = int(maxy * CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT_DEFAULT)
+        else:
+            width_px = int(top_right_icon_width)
+            height_px = int(top_right_icon_height)
+    except Exception:
+        width_px = int(top_right_icon_width)
+        height_px = int(top_right_icon_height)
+
+    # Diagnostic logging removed in preparation for merge.
+
+    # Activation: touch is in the rightmost `width_px` pixels and within `height_px` from top
+    is_in_area = (x >= maxx - width_px and x != -1 and y >= 0 and y <= height_px)
+
+    return bool(is_in_area)
+
+
+def is_alt_pressed(right_only=False):
+    """Return True if Alt is currently pressed.
+    If right_only is True, only consider the right Alt (Alt_R / AltGr).
+    Works for both X11 and Wayland when keymap/keyboard_state is available.
+    """
+    # Alt detection: try Wayland keyboard state, X11 display, then kernel evdev fallback
+    try:
+        # Wayland / xkbcommon path: check depressed modifier indices and their names
+        if display_wayland and keyboard_state:
+
+            try:
+                keymap = keyboard_state.get_keymap()
+                for mod_index in range(0, keymap.num_mods()):
+                    if keyboard_state.mod_index_is_active(mod_index, xkb.StateComponent.XKB_STATE_MODS_DEPRESSED):
+                        mod_name = keymap.mod_get_name(mod_index)
+                        log.debug("is_alt_pressed: Wayland depressed mod: %s", mod_name)
+                        if right_only:
+                            if mod_name in ('RAlt', 'AltGr'):
+                                return True
+                        else:
+                            if mod_name in ('Mod1', 'Alt', 'LAlt', 'RAlt', 'AltGr'):
+                                return True
+            except Exception as e:
+
+                # fall through to X11 check
+                pass
+
+        # X11 path: use query_keymap to see depressed Alt key keycodes
+        if display:
+
+            try:
+                keymap = display.query_keymap()
+                alt_names = ('Alt_R',) if right_only else ('Alt_L', 'Alt_R')
+                for alt_name in alt_names:
+                    try:
+                        kc = display.keysym_to_keycode(Xlib.XK.string_to_keysym(alt_name))
+                        if kc:
+                            index = kc >> 3
+                            bit = 1 << (kc & 7)
+                            if keymap[index] & bit:
+                                log.debug("is_alt_pressed: X11 found Alt pressed: %s", alt_name)
+                                return True
+                    except Exception as e2:
+                        log.debug("is_alt_pressed: X11 alt check failed for %s: %s", alt_name, e2)
+                        continue
+            except Exception as e:
+
+                pass
+
+    except Exception as e:
+
+        pass
+
+    # Fallback: read kernel keyboard device state(s) directly if available.
+    # Try the detected `keyboard` device first, then scan candidate input devices.
+
+    try:
+        checked = []
+
+        def check_device_eventnum(evnum):
+            try:
+                devpath = '/dev/input/event' + str(evnum)
+                with open(devpath, 'rb') as fd_k:
+                    d_k = Device(fd_k)
+                    # Only consider devices that expose keys
+                    if not d_k.has(EV_KEY.KEY_LEFTALT) and not d_k.has(EV_KEY.KEY_RIGHTALT):
+                        return None
+
+                    # read key state values; fall back to .value.get if indexing fails
+                    left_alt = 0
+                    right_alt = 0
+                    try:
+                        left_alt = int(d_k.value[EV_KEY.KEY_LEFTALT])
+                    except Exception:
+                        try:
+                            left_alt = int(d_k.value.get(EV_KEY.KEY_ALT_L, 0))
+                        except Exception:
+                            left_alt = 0
+
+                    try:
+                        right_alt = int(d_k.value[EV_KEY.KEY_RIGHTALT])
+                    except Exception:
+                        try:
+                            right_alt = int(d_k.value.get(EV_KEY.KEY_ALT_R, 0))
+                        except Exception:
+                            right_alt = 0
+
+
+                    return (bool(left_alt), bool(right_alt))
+            except Exception:
+                return None
+
+        # Skip the touchpad's keyboard device (event6) - it won't see physical Alt key presses
+        # from the actual keyboard. We'll scan for real keyboard devices below.
+
+        # Explicitly try common event device used by external diagnostics
+        # (users often observe Alt events on `/dev/input/event12`). Probe it
+        # early so logs clearly show whether that device reports Alt pressed.
+        try:
+            # Allow forcing a specific kernel event device via environment
+            # variable `NUMPAD_ALT_DEVICE` (set to a full path like
+            # `/dev/input/event12`). This helps reproduce user's evtest
+            # observations and ensures we probe the exact device they see.
+            env_dev = os.environ.get('NUMPAD_ALT_DEVICE')
+            if env_dev:
+                # normalize to just the trailing number if a path was given
+                m = re.search(r'event(\d+)$', env_dev)
+                if m:
+                    evn = m.group(1)
+                    if evn not in checked and os.path.exists(env_dev):
+                        res_env = check_device_eventnum(evn)
+
+                        if res_env is not None:
+                            left_alt, right_alt = res_env
+                            # Only return True if Alt is pressed, otherwise continue checking
+                            if right_only:
+                                if right_alt:
+                                    return True
+                            else:
+                                if left_alt or right_alt:
+                                    return True
+                            checked.append(evn)
+
+            # fallback explicit common device probe
+            if os.path.exists('/dev/input/event12') and '12' not in checked:
+                res12 = check_device_eventnum('12')
+
+                if res12 is not None:
+                    left_alt, right_alt = res12
+                    # Only return True if Alt is actually pressed on this device
+                    # If Alt is not pressed here, continue checking other keyboards
+                    if right_only:
+                        if right_alt:
+                            return True
+                    else:
+                        if left_alt or right_alt:
+                            return True
+                    # Alt not pressed on event12, mark it as checked and continue
+                    checked.append('12')
+        except Exception:
+            pass
+        # Scan /proc/bus/input/devices for candidate handlers
+        try:
+            # Collect candidate event devices from /proc/bus/input/devices and
+            # prioritize real keyboards over touchpad keyboards. Filter out
+            # the touchpad keyboard device (event6) since it won't see physical
+            # Alt key presses. Prioritize actual keyboard devices by looking at
+            # the device name and handlers.
+            candidates = []
+            current_name = ""
+            with open('/proc/bus/input/devices', 'r') as f:
+                for line in f:
+                    if line.startswith('N: '):
+                        current_name = line.strip()[len('N: Name='):].strip('"')
+                    elif line.startswith('H: '):
+                        handlers = line.strip()[3:]
+                        m = re.search(r'event(\d+)', handlers)
+                        if m:
+                            evnum = m.group(1)
+                            if evnum in checked:
+                                continue
+
+                            # Skip touchpad keyboard device - it won't see physical key presses
+                            # The touchpad keyboard device usually has the same model ID as the touchpad
+                            # e.g., "ASUF1416:00 2808:0108 Keyboard" is part of the touchpad (compare with "ASUF1416:00 2808:0108 Touchpad")
+                            # Also skip if device name explicitly contains both "Touchpad" and "Keyboard"
+                            is_touchpad_kbd = False
+                            if 'Touchpad' in current_name and 'Keyboard' in current_name:
+                                is_touchpad_kbd = True
+                            elif 'Keyboard' in current_name and ('ASUF' in current_name or 'ELAN' in current_name or 'SYNA' in current_name):
+                                # Touchpad keyboard devices often have manufacturer IDs like ASUF, ELAN, SYNA in the name
+                                # These same IDs appear in the touchpad device name
+                                is_touchpad_kbd = True
+
+                            if is_touchpad_kbd:
+                                log.debug("Skipping touchpad keyboard device: event%s (%s)", evnum, current_name)
+                                continue
+
+                            # simple heuristics: prefer handlers mentioning kbd or leds
+                            handlers_l = handlers.lower()
+                            has_kbd = 'kbd' in handlers_l
+                            has_led = 'led' in handlers_l or 'leds' in handlers_l
+                            # record candidate with its handler line and device name for sorting
+                            candidates.append((evnum, handlers, current_name, has_kbd, has_led))
+
+            if candidates:
+                # sort by priority: physical keyboards first (with leds), then other kbd devices
+                def _priority(t):
+                    evnum, handlers, name, has_kbd, has_led = t
+                    # Prefer keyboards that have LED support (numlock LED, etc) - these are usually the main keyboard
+                    # Prefer devices that don't have "Mouse" or other non-keyboard words
+                    is_likely_keyboard = has_kbd and has_led and 'Mouse' not in name
+                    is_kbd_with_led = has_kbd and has_led
+                    is_kbd = has_kbd
+                    # Lower number = higher priority
+                    return (
+                        0 if is_likely_keyboard else 1,
+                        0 if is_kbd_with_led else 1,
+                        0 if is_kbd else 1,
+                        int(evnum)  # tie-breaker: lower event number first
+                    )
+
+                candidates_sorted = sorted(candidates, key=_priority)
+
+
+
+                for evnum, handlers, name, has_kbd, has_led in candidates_sorted:
+                    checked.append(evnum)
+                    res = check_device_eventnum(evnum)
+                    if res is not None:
+                        left_alt, right_alt = res
+                        if right_only:
+                            if right_alt:
+                                return True
+                        else:
+                            if left_alt or right_alt:
+                                return True
+        except Exception:
+            pass
+
+    except Exception:
+        pass
 
     return False
+
+
+def get_active_modifiers():
+    """Return a list of active modifier names detected via Wayland (xkb) or X11.
+    This is a debug helper and may be noisy.
+    """
+    mods = []
+    try:
+        if display_wayland and keyboard_state:
+            try:
+                keymap = keyboard_state.get_keymap()
+                for mod_index in range(0, keymap.num_mods()):
+                    if keyboard_state.mod_index_is_active(mod_index, xkb.StateComponent.XKB_STATE_MODS_DEPRESSED):
+                        try:
+                            mods.append(keymap.mod_get_name(mod_index))
+                        except Exception:
+                            mods.append(str(mod_index))
+            except Exception:
+                pass
+
+        if display:
+            try:
+                keymap = display.query_keymap()
+                # check common modifier keysyms
+                common = ['Alt_L', 'Alt_R', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Meta_L', 'Meta_R', 'Num_Lock', 'Caps_Lock']
+                for name in common:
+                    try:
+                        kc = display.keysym_to_keycode(Xlib.XK.string_to_keysym(name))
+                        if kc:
+                            index = kc >> 3
+                            bit = 1 << (kc & 7)
+                            if keymap[index] & bit:
+                                mods.append(name)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    return list(dict.fromkeys(mods))
 
 
 def is_pressed_touchpad_top_left_icon():
@@ -1582,6 +1909,8 @@ def load_all_config_values():
     global backlight_levels
     global idled
     global top_left_icon_slide_func_disabled
+    global require_alt_for_top_right_activation
+    global require_right_alt_only
 
     #log.debug("load_all_config_values: config_lock.acquire will be called")
     config_lock.acquire()
@@ -1648,6 +1977,21 @@ def load_all_config_values():
 
     distance_to_move_only_pointer = float(config_get(CONFIG_DISTANCE_TO_MOVE_ONLY_POINTER, CONFIG_DISTANCE_TO_MOVE_ONLY_POINTER_DEFAULT))
 
+    # require Alt modifier for top-right activation
+    require_alt_for_top_right_activation = config_get(CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION, CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION_DEFAULT)
+    require_right_alt_only = config_get(CONFIG_REQUIRE_RIGHT_ALT_ONLY, CONFIG_REQUIRE_RIGHT_ALT_ONLY_DEFAULT)
+
+    # percentage-based top-right activation
+    use_percent_top_right_icon = config_get(CONFIG_USE_PERCENT_TOP_RIGHT, CONFIG_USE_PERCENT_TOP_RIGHT_DEFAULT)
+    try:
+        top_right_icon_width_percent = float(config_get(CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT, CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT_DEFAULT))
+    except Exception:
+        top_right_icon_width_percent = CONFIG_TOP_RIGHT_ICON_WIDTH_PERCENT_DEFAULT
+    try:
+        top_right_icon_height_percent = float(config_get(CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT, CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT_DEFAULT))
+    except Exception:
+        top_right_icon_height_percent = CONFIG_TOP_RIGHT_ICON_HEIGHT_PERCENT_DEFAULT
+
     idled = config_get(CONFIG_IDLED, CONFIG_IDLED_DEFAULT)
     idle_brightness = float(config_get(CONFIG_IDLE_BRIGHTNESS, CONFIG_IDLE_BRIGHTNESS_DEFAULT))
     idle_enabled = config_get(CONFIG_IDLE_ENABLED, CONFIG_IDLE_ENABLED_DEFAULT)
@@ -1655,6 +1999,13 @@ def load_all_config_values():
     top_left_icon_slide_func_disabled = int(config_get(CONFIG_TOP_LEFT_ICON_SLIDE_FUNC_DISABLED, CONFIG_TOP_LEFT_ICON_SLIDE_FUNC_DISABLED_DEFAULT))
 
     config_lock.release()
+
+    # Debug: show important flags that affect activation behaviour
+    try:
+        log.info("Config: require_alt_for_top_right_activation=%s require_right_alt_only=%s activation_time=%s",
+                 require_alt_for_top_right_activation, require_right_alt_only, activation_time)
+    except Exception:
+        log.debug("Config: (unable to print require-alt flags)")
 
     if enabled is not numlock:
         local_numlock_pressed()
@@ -2011,12 +2362,27 @@ def pressed_touchpad_top_right_icon(e):
 
         abs_mt_slot_numpad_key[abs_mt_slot_value] = get_evdev_key_for_char('Num_Lock')
     elif e.value == 0:
-        top_right_icon_touch_start_time = 0
-        numlock_touch_start_time = 0
+        # Be conservative when clearing the numlock timer: only clear when
+        # the slot coordinates are already cleared (-1), otherwise a
+        # BTN_TOOL_FINGER=0 event arriving slightly before tracking id
+        # teardown can cancel a valid long-press. This avoids the pattern
+        # seen in logs where a touch is detected then immediately cleared.
+        try:
+            cur_x = abs_mt_slot_x_values[abs_mt_slot_value]
+            cur_y = abs_mt_slot_y_values[abs_mt_slot_value]
+        except Exception:
+            cur_x = -1
+            cur_y = -1
 
-        set_none_to_current_mt_slot()
+        # Only clear if coordinates are already reset (finger truly ended for this slot)
+        if cur_x == -1 and cur_y == -1:
+            top_right_icon_touch_start_time = 0
+            numlock_touch_start_time = 0
 
-        log.info("Un-touched top_right_icon area (representing numlock key) in time: %s", time())
+            set_none_to_current_mt_slot()
+
+            log.info("Un-touched top_right_icon area (representing numlock key) in time: %s", time())
+
 
 
 def is_slided_from_top_right_icon():
@@ -2226,6 +2592,8 @@ def listen_touchpad_events():
         key_pointer_button_is_touched, is_idled, minx_numpad, miny_numpad, col_width, row_height, maxy_numpad, maxx_numpad,\
         top_left_icon_slide_func_activates_numpad, current_slot_x, current_slot_y, top_left_icon_slide_func_disabled
 
+    log.info("Starting touchpad event loop...")
+
     try:
 
         for e in d_t.events():
@@ -2318,10 +2686,40 @@ def listen_touchpad_events():
                 # top right icon (numlock) activation
                 touched_key = get_touched_key()
                 top_right_icon = is_pressed_touchpad_top_right_icon()
-                if (top_right_icon or touched_key == get_evdev_key_for_char('Num_Lock')) and takes_numlock_longer_then_set_up_activation_time():
 
-                  local_numlock_pressed()
-                  continue
+                # If we detect the finger over the top-right area via timestamp
+                # but the BTN_TOOL event wasn't delivered, start the numlock
+                # long-press timer here once when we first see a valid slot.
+                try:
+                    if top_right_icon and numlock_touch_start_time == 0 and abs_mt_slot_x_values[abs_mt_slot_value] != -1:
+                        top_right_icon_touch_start_time = time()
+                        numlock_touch_start_time = time()
+                        abs_mt_slot_numpad_key[abs_mt_slot_value] = get_evdev_key_for_char('Num_Lock')
+                        log.info("Touched top_right_icon area (numlock) detected via timestamp at: %s", time())
+                except Exception:
+                    pass
+
+                if (top_right_icon or touched_key == get_evdev_key_for_char('Num_Lock')) and takes_numlock_longer_then_set_up_activation_time():
+                    # Alt requirement only applies to activation, not deactivation
+                    # If numpad is already active, allow deactivation without Alt
+                    if numlock:
+                        # Deactivating - no Alt required
+                        local_numlock_pressed()
+                    else:
+                        # Activating - check Alt requirement
+                        require_alt = config_get(CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION, CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION_DEFAULT)
+                        require_right = config_get(CONFIG_REQUIRE_RIGHT_ALT_ONLY, CONFIG_REQUIRE_RIGHT_ALT_ONLY_DEFAULT)
+
+                        alt_ok = True
+                        if require_alt:
+                            alt_ok = is_alt_pressed(require_right)
+
+                        if not alt_ok and require_alt:
+                            log.info("Top-right activation blocked: Alt not held")
+                        elif alt_ok:
+                            local_numlock_pressed()
+
+                    continue
 
                 # top left icon (brightness change) activation
                 if numlock and is_pressed_touchpad_top_left_icon() and\
@@ -2368,7 +2766,24 @@ def listen_touchpad_events():
 
                     continue
                 elif is_slided_from_top_right_icon():
-                    local_numlock_pressed()
+                    # Alt requirement only applies to activation, not deactivation
+                    if numlock:
+                        # Deactivating - no Alt required
+                        local_numlock_pressed()
+                    else:
+                        # Activating - check Alt requirement
+                        require_alt = config_get(CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION, CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION_DEFAULT)
+                        require_right = config_get(CONFIG_REQUIRE_RIGHT_ALT_ONLY, CONFIG_REQUIRE_RIGHT_ALT_ONLY_DEFAULT)
+
+                        alt_ok = True
+                        if require_alt:
+                            alt_ok = is_alt_pressed(require_right)
+
+                        if not alt_ok and require_alt:
+                            log.info("Top-right slide activation blocked: Alt not held")
+                        elif alt_ok:
+                            local_numlock_pressed()
+
                     continue
 
             if e.matches(EV_ABS.ABS_MT_POSITION_Y):
@@ -2396,7 +2811,24 @@ def listen_touchpad_events():
                 is_not_finger_moved_to_another_key()
 
                 if is_slided_from_top_right_icon():
-                    local_numlock_pressed()
+                    # Alt requirement only applies to activation, not deactivation
+                    if numlock:
+                        # Deactivating - no Alt required
+                        local_numlock_pressed()
+                    else:
+                        # Activating - check Alt requirement
+                        require_alt = config_get(CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION, CONFIG_REQUIRE_ALT_TOP_RIGHT_ACTIVATION_DEFAULT)
+                        require_right = config_get(CONFIG_REQUIRE_RIGHT_ALT_ONLY, CONFIG_REQUIRE_RIGHT_ALT_ONLY_DEFAULT)
+
+                        alt_ok = True
+                        if require_alt:
+                            alt_ok = is_alt_pressed(require_right)
+
+                        if not alt_ok and require_alt:
+                            log.info("Top-right Y-axis slide activation blocked: Alt not held")
+                        elif alt_ok:
+                            local_numlock_pressed()
+
                     continue
 
             if e.matches(EV_ABS.ABS_MT_TRACKING_ID):
